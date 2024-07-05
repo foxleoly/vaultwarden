@@ -79,6 +79,8 @@ pub fn routes() -> Vec<Route> {
         delete_all,
         move_cipher_selected,
         move_cipher_selected_put,
+        put_collections2_update,
+        post_collections2_update,
         put_collections_update,
         post_collections_update,
         post_collections_admin,
@@ -562,16 +564,23 @@ async fn post_ciphers_import(
     Cipher::validate_notes(&data.ciphers)?;
 
     // Read and create the folders
-    let mut folders: Vec<_> = Vec::new();
+    let existing_folders: Vec<String> =
+        Folder::find_by_user(&headers.user.uuid, &mut conn).await.into_iter().map(|f| f.uuid).collect();
+    let mut folders: Vec<String> = Vec::with_capacity(data.folders.len());
     for folder in data.folders.into_iter() {
-        let mut new_folder = Folder::new(headers.user.uuid.clone(), folder.name);
-        new_folder.save(&mut conn).await?;
+        let folder_uuid = if folder.id.is_some() && existing_folders.contains(folder.id.as_ref().unwrap()) {
+            folder.id.unwrap()
+        } else {
+            let mut new_folder = Folder::new(headers.user.uuid.clone(), folder.name);
+            new_folder.save(&mut conn).await?;
+            new_folder.uuid
+        };
 
-        folders.push(new_folder);
+        folders.push(folder_uuid);
     }
 
     // Read the relations between folders and ciphers
-    let mut relations_map = HashMap::new();
+    let mut relations_map = HashMap::with_capacity(data.folder_relationships.len());
 
     for relation in data.folder_relationships {
         relations_map.insert(relation.key, relation.value);
@@ -579,7 +588,7 @@ async fn post_ciphers_import(
 
     // Read and create the ciphers
     for (index, mut cipher_data) in data.ciphers.into_iter().enumerate() {
-        let folder_uuid = relations_map.get(&index).map(|i| folders[*i].uuid.clone());
+        let folder_uuid = relations_map.get(&index).map(|i| folders[*i].clone());
         cipher_data.folder_id = folder_uuid;
 
         let mut cipher = Cipher::new(cipher_data.r#type, cipher_data.name.clone());
@@ -695,6 +704,33 @@ struct CollectionsAdminData {
     collection_ids: Vec<String>,
 }
 
+#[put("/ciphers/<uuid>/collections_v2", data = "<data>")]
+async fn put_collections2_update(
+    uuid: &str,
+    data: Json<CollectionsAdminData>,
+    headers: Headers,
+    conn: DbConn,
+    nt: Notify<'_>,
+) -> JsonResult {
+    post_collections2_update(uuid, data, headers, conn, nt).await
+}
+
+#[post("/ciphers/<uuid>/collections_v2", data = "<data>")]
+async fn post_collections2_update(
+    uuid: &str,
+    data: Json<CollectionsAdminData>,
+    headers: Headers,
+    conn: DbConn,
+    nt: Notify<'_>,
+) -> JsonResult {
+    let cipher_details = post_collections_update(uuid, data, headers, conn, nt).await?;
+    Ok(Json(json!({ // AttachmentUploadDataResponseModel
+        "object": "optionalCipherDetails",
+        "unavailable": false,
+        "cipher": *cipher_details
+    })))
+}
+
 #[put("/ciphers/<uuid>/collections", data = "<data>")]
 async fn put_collections_update(
     uuid: &str,
@@ -702,8 +738,8 @@ async fn put_collections_update(
     headers: Headers,
     conn: DbConn,
     nt: Notify<'_>,
-) -> EmptyResult {
-    post_collections_admin(uuid, data, headers, conn, nt).await
+) -> JsonResult {
+    post_collections_update(uuid, data, headers, conn, nt).await
 }
 
 #[post("/ciphers/<uuid>/collections", data = "<data>")]
@@ -711,10 +747,65 @@ async fn post_collections_update(
     uuid: &str,
     data: Json<CollectionsAdminData>,
     headers: Headers,
-    conn: DbConn,
+    mut conn: DbConn,
     nt: Notify<'_>,
-) -> EmptyResult {
-    post_collections_admin(uuid, data, headers, conn, nt).await
+) -> JsonResult {
+    let data: CollectionsAdminData = data.into_inner();
+
+    let cipher = match Cipher::find_by_uuid(uuid, &mut conn).await {
+        Some(cipher) => cipher,
+        None => err!("Cipher doesn't exist"),
+    };
+
+    if !cipher.is_write_accessible_to_user(&headers.user.uuid, &mut conn).await {
+        err!("Cipher is not write accessible")
+    }
+
+    let posted_collections = HashSet::<String>::from_iter(data.collection_ids);
+    let current_collections =
+        HashSet::<String>::from_iter(cipher.get_collections(headers.user.uuid.clone(), &mut conn).await);
+
+    for collection in posted_collections.symmetric_difference(&current_collections) {
+        match Collection::find_by_uuid(collection, &mut conn).await {
+            None => err!("Invalid collection ID provided"),
+            Some(collection) => {
+                if collection.is_writable_by_user(&headers.user.uuid, &mut conn).await {
+                    if posted_collections.contains(&collection.uuid) {
+                        // Add to collection
+                        CollectionCipher::save(&cipher.uuid, &collection.uuid, &mut conn).await?;
+                    } else {
+                        // Remove from collection
+                        CollectionCipher::delete(&cipher.uuid, &collection.uuid, &mut conn).await?;
+                    }
+                } else {
+                    err!("No rights to modify the collection")
+                }
+            }
+        }
+    }
+
+    nt.send_cipher_update(
+        UpdateType::SyncCipherUpdate,
+        &cipher,
+        &cipher.update_users_revision(&mut conn).await,
+        &headers.device.uuid,
+        Some(Vec::from_iter(posted_collections)),
+        &mut conn,
+    )
+    .await;
+
+    log_event(
+        EventType::CipherUpdatedCollections as i32,
+        &cipher.uuid,
+        &cipher.organization_uuid.clone().unwrap(),
+        &headers.user.uuid,
+        headers.device.atype,
+        &headers.ip.ip,
+        &mut conn,
+    )
+    .await;
+
+    Ok(Json(cipher.to_json(&headers.host, &headers.user.uuid, None, CipherSyncType::User, &mut conn).await))
 }
 
 #[put("/ciphers/<uuid>/collections-admin", data = "<data>")]
@@ -747,9 +838,9 @@ async fn post_collections_admin(
         err!("Cipher is not write accessible")
     }
 
-    let posted_collections: HashSet<String> = data.collection_ids.iter().cloned().collect();
-    let current_collections: HashSet<String> =
-        cipher.get_collections(headers.user.uuid.clone(), &mut conn).await.iter().cloned().collect();
+    let posted_collections = HashSet::<String>::from_iter(data.collection_ids);
+    let current_collections =
+        HashSet::<String>::from_iter(cipher.get_admin_collections(headers.user.uuid.clone(), &mut conn).await);
 
     for collection in posted_collections.symmetric_difference(&current_collections) {
         match Collection::find_by_uuid(collection, &mut conn).await {
