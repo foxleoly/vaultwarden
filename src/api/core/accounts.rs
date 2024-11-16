@@ -1,5 +1,7 @@
+use std::collections::HashSet;
+
 use crate::db::DbPool;
-use chrono::{SecondsFormat, Utc};
+use chrono::Utc;
 use rocket::serde::json::Json;
 use serde_json::Value;
 
@@ -13,7 +15,7 @@ use crate::{
     crypto,
     db::{models::*, DbConn},
     mail,
-    util::NumberOrString,
+    util::{format_date, NumberOrString},
     CONFIG,
 };
 
@@ -477,6 +479,60 @@ struct KeyData {
     private_key: String,
 }
 
+fn validate_keydata(
+    data: &KeyData,
+    existing_ciphers: &[Cipher],
+    existing_folders: &[Folder],
+    existing_emergency_access: &[EmergencyAccess],
+    existing_user_orgs: &[UserOrganization],
+    existing_sends: &[Send],
+) -> EmptyResult {
+    // Check that we're correctly rotating all the user's ciphers
+    let existing_cipher_ids = existing_ciphers.iter().map(|c| c.uuid.as_str()).collect::<HashSet<_>>();
+    let provided_cipher_ids = data
+        .ciphers
+        .iter()
+        .filter(|c| c.organization_id.is_none())
+        .filter_map(|c| c.id.as_deref())
+        .collect::<HashSet<_>>();
+    if !provided_cipher_ids.is_superset(&existing_cipher_ids) {
+        err!("All existing ciphers must be included in the rotation")
+    }
+
+    // Check that we're correctly rotating all the user's folders
+    let existing_folder_ids = existing_folders.iter().map(|f| f.uuid.as_str()).collect::<HashSet<_>>();
+    let provided_folder_ids = data.folders.iter().filter_map(|f| f.id.as_deref()).collect::<HashSet<_>>();
+    if !provided_folder_ids.is_superset(&existing_folder_ids) {
+        err!("All existing folders must be included in the rotation")
+    }
+
+    // Check that we're correctly rotating all the user's emergency access keys
+    let existing_emergency_access_ids =
+        existing_emergency_access.iter().map(|ea| ea.uuid.as_str()).collect::<HashSet<_>>();
+    let provided_emergency_access_ids =
+        data.emergency_access_keys.iter().map(|ea| ea.id.as_str()).collect::<HashSet<_>>();
+    if !provided_emergency_access_ids.is_superset(&existing_emergency_access_ids) {
+        err!("All existing emergency access keys must be included in the rotation")
+    }
+
+    // Check that we're correctly rotating all the user's reset password keys
+    let existing_reset_password_ids = existing_user_orgs.iter().map(|uo| uo.org_uuid.as_str()).collect::<HashSet<_>>();
+    let provided_reset_password_ids =
+        data.reset_password_keys.iter().map(|rp| rp.organization_id.as_str()).collect::<HashSet<_>>();
+    if !provided_reset_password_ids.is_superset(&existing_reset_password_ids) {
+        err!("All existing reset password keys must be included in the rotation")
+    }
+
+    // Check that we're correctly rotating all the user's sends
+    let existing_send_ids = existing_sends.iter().map(|s| s.uuid.as_str()).collect::<HashSet<_>>();
+    let provided_send_ids = data.sends.iter().filter_map(|s| s.id.as_deref()).collect::<HashSet<_>>();
+    if !provided_send_ids.is_superset(&existing_send_ids) {
+        err!("All existing sends must be included in the rotation")
+    }
+
+    Ok(())
+}
+
 #[post("/accounts/key", data = "<data>")]
 async fn post_rotatekey(data: Json<KeyData>, headers: Headers, mut conn: DbConn, nt: Notify<'_>) -> EmptyResult {
     // TODO: See if we can wrap everything within a SQL Transaction. If something fails it should revert everything.
@@ -494,19 +550,34 @@ async fn post_rotatekey(data: Json<KeyData>, headers: Headers, mut conn: DbConn,
 
     let user_uuid = &headers.user.uuid;
 
+    // TODO: Ideally we'd do everything after this point in a single transaction.
+
+    let mut existing_ciphers = Cipher::find_owned_by_user(user_uuid, &mut conn).await;
+    let mut existing_folders = Folder::find_by_user(user_uuid, &mut conn).await;
+    let mut existing_emergency_access = EmergencyAccess::find_all_by_grantor_uuid(user_uuid, &mut conn).await;
+    let mut existing_user_orgs = UserOrganization::find_by_user(user_uuid, &mut conn).await;
+    // We only rotate the reset password key if it is set.
+    existing_user_orgs.retain(|uo| uo.reset_password_key.is_some());
+    let mut existing_sends = Send::find_by_user(user_uuid, &mut conn).await;
+
+    validate_keydata(
+        &data,
+        &existing_ciphers,
+        &existing_folders,
+        &existing_emergency_access,
+        &existing_user_orgs,
+        &existing_sends,
+    )?;
+
     // Update folder data
     for folder_data in data.folders {
         // Skip `null` folder id entries.
         // See: https://github.com/bitwarden/clients/issues/8453
         if let Some(folder_id) = folder_data.id {
-            let mut saved_folder = match Folder::find_by_uuid(&folder_id, &mut conn).await {
+            let saved_folder = match existing_folders.iter_mut().find(|f| f.uuid == folder_id) {
                 Some(folder) => folder,
                 None => err!("Folder doesn't exist"),
             };
-
-            if &saved_folder.user_uuid != user_uuid {
-                err!("The folder is not owned by the user")
-            }
 
             saved_folder.name = folder_data.name;
             saved_folder.save(&mut conn).await?
@@ -515,9 +586,8 @@ async fn post_rotatekey(data: Json<KeyData>, headers: Headers, mut conn: DbConn,
 
     // Update emergency access data
     for emergency_access_data in data.emergency_access_keys {
-        let mut saved_emergency_access =
-            match EmergencyAccess::find_by_uuid_and_grantor_uuid(&emergency_access_data.id, user_uuid, &mut conn).await
-            {
+        let saved_emergency_access =
+            match existing_emergency_access.iter_mut().find(|ea| ea.uuid == emergency_access_data.id) {
                 Some(emergency_access) => emergency_access,
                 None => err!("Emergency access doesn't exist or is not owned by the user"),
             };
@@ -528,13 +598,11 @@ async fn post_rotatekey(data: Json<KeyData>, headers: Headers, mut conn: DbConn,
 
     // Update reset password data
     for reset_password_data in data.reset_password_keys {
-        let mut user_org =
-            match UserOrganization::find_by_user_and_org(user_uuid, &reset_password_data.organization_id, &mut conn)
-                .await
-            {
-                Some(reset_password) => reset_password,
-                None => err!("Reset password doesn't exist"),
-            };
+        let user_org = match existing_user_orgs.iter_mut().find(|uo| uo.org_uuid == reset_password_data.organization_id)
+        {
+            Some(reset_password) => reset_password,
+            None => err!("Reset password doesn't exist"),
+        };
 
         user_org.reset_password_key = Some(reset_password_data.reset_password_key);
         user_org.save(&mut conn).await?
@@ -542,12 +610,12 @@ async fn post_rotatekey(data: Json<KeyData>, headers: Headers, mut conn: DbConn,
 
     // Update send data
     for send_data in data.sends {
-        let mut send = match Send::find_by_uuid(send_data.id.as_ref().unwrap(), &mut conn).await {
+        let send = match existing_sends.iter_mut().find(|s| &s.uuid == send_data.id.as_ref().unwrap()) {
             Some(send) => send,
             None => err!("Send doesn't exist"),
         };
 
-        update_send_from_data(&mut send, send_data, &headers, &mut conn, &nt, UpdateType::None).await?;
+        update_send_from_data(send, send_data, &headers, &mut conn, &nt, UpdateType::None).await?;
     }
 
     // Update cipher data
@@ -555,20 +623,15 @@ async fn post_rotatekey(data: Json<KeyData>, headers: Headers, mut conn: DbConn,
 
     for cipher_data in data.ciphers {
         if cipher_data.organization_id.is_none() {
-            let mut saved_cipher = match Cipher::find_by_uuid(cipher_data.id.as_ref().unwrap(), &mut conn).await {
+            let saved_cipher = match existing_ciphers.iter_mut().find(|c| &c.uuid == cipher_data.id.as_ref().unwrap()) {
                 Some(cipher) => cipher,
                 None => err!("Cipher doesn't exist"),
             };
 
-            if saved_cipher.user_uuid.as_ref().unwrap() != user_uuid {
-                err!("The cipher is not owned by the user")
-            }
-
             // Prevent triggering cipher updates via WebSockets by settings UpdateType::None
             // The user sessions are invalidated because all the ciphers were re-encrypted and thus triggering an update could cause issues.
             // We force the users to logout after the user has been saved to try and prevent these issues.
-            update_cipher_from_data(&mut saved_cipher, cipher_data, &headers, None, &mut conn, &nt, UpdateType::None)
-                .await?
+            update_cipher_from_data(saved_cipher, cipher_data, &headers, None, &mut conn, &nt, UpdateType::None).await?
         }
     }
 
@@ -842,7 +905,7 @@ struct PasswordHintData {
 
 #[post("/accounts/password-hint", data = "<data>")]
 async fn password_hint(data: Json<PasswordHintData>, mut conn: DbConn) -> EmptyResult {
-    if !CONFIG.mail_enabled() && !CONFIG.show_password_hint() {
+    if !CONFIG.password_hints_allowed() || (!CONFIG.mail_enabled() && !CONFIG.show_password_hint()) {
         err!("This server is not configured to provide password hints.");
     }
 
@@ -901,14 +964,12 @@ pub async fn _prelogin(data: Json<PreloginData>, mut conn: DbConn) -> Json<Value
         None => (User::CLIENT_KDF_TYPE_DEFAULT, User::CLIENT_KDF_ITER_DEFAULT, None, None),
     };
 
-    let result = json!({
+    Json(json!({
         "kdf": kdf_type,
         "kdfIterations": kdf_iter,
         "kdfMemory": kdf_mem,
         "kdfParallelism": kdf_para,
-    });
-
-    Json(result)
+    }))
 }
 
 // https://github.com/bitwarden/server/blob/master/src/Api/Models/Request/Accounts/SecretVerificationRequestModel.cs
@@ -1084,14 +1145,15 @@ struct AuthRequestRequest {
     device_identifier: String,
     email: String,
     public_key: String,
-    #[serde(alias = "type")]
-    _type: i32,
+    // Not used for now
+    // #[serde(alias = "type")]
+    // _type: i32,
 }
 
 #[post("/auth-requests", data = "<data>")]
 async fn post_auth_request(
     data: Json<AuthRequestRequest>,
-    headers: ClientHeaders,
+    client_headers: ClientHeaders,
     mut conn: DbConn,
     nt: Notify<'_>,
 ) -> JsonResult {
@@ -1099,16 +1161,20 @@ async fn post_auth_request(
 
     let user = match User::find_by_mail(&data.email, &mut conn).await {
         Some(user) => user,
-        None => {
-            err!("AuthRequest doesn't exist")
-        }
+        None => err!("AuthRequest doesn't exist", "User not found"),
     };
+
+    // Validate device uuid and type
+    match Device::find_by_uuid_and_user(&data.device_identifier, &user.uuid, &mut conn).await {
+        Some(device) if device.atype == client_headers.device_type => {}
+        _ => err!("AuthRequest doesn't exist", "Device verification failed"),
+    }
 
     let mut auth_request = AuthRequest::new(
         user.uuid.clone(),
         data.device_identifier.clone(),
-        headers.device_type,
-        headers.ip.ip.to_string(),
+        client_headers.device_type,
+        client_headers.ip.ip.to_string(),
         data.access_code,
         data.public_key,
     );
@@ -1123,7 +1189,7 @@ async fn post_auth_request(
         "requestIpAddress": auth_request.request_ip,
         "key": null,
         "masterPasswordHash": null,
-        "creationDate": auth_request.creation_date.and_utc().to_rfc3339_opts(SecondsFormat::Micros, true),
+        "creationDate": format_date(&auth_request.creation_date),
         "responseDate": null,
         "requestApproved": false,
         "origin": CONFIG.domain_origin(),
@@ -1132,33 +1198,31 @@ async fn post_auth_request(
 }
 
 #[get("/auth-requests/<uuid>")]
-async fn get_auth_request(uuid: &str, mut conn: DbConn) -> JsonResult {
+async fn get_auth_request(uuid: &str, headers: Headers, mut conn: DbConn) -> JsonResult {
     let auth_request = match AuthRequest::find_by_uuid(uuid, &mut conn).await {
         Some(auth_request) => auth_request,
-        None => {
-            err!("AuthRequest doesn't exist")
-        }
+        None => err!("AuthRequest doesn't exist", "Record not found"),
     };
 
-    let response_date_utc = auth_request
-        .response_date
-        .map(|response_date| response_date.and_utc().to_rfc3339_opts(SecondsFormat::Micros, true));
+    if headers.user.uuid != auth_request.user_uuid {
+        err!("AuthRequest doesn't exist", "User uuid's do not match")
+    }
 
-    Ok(Json(json!(
-        {
-            "id": uuid,
-            "publicKey": auth_request.public_key,
-            "requestDeviceType": DeviceType::from_i32(auth_request.device_type).to_string(),
-            "requestIpAddress": auth_request.request_ip,
-            "key": auth_request.enc_key,
-            "masterPasswordHash": auth_request.master_password_hash,
-            "creationDate": auth_request.creation_date.and_utc().to_rfc3339_opts(SecondsFormat::Micros, true),
-            "responseDate": response_date_utc,
-            "requestApproved": auth_request.approved,
-            "origin": CONFIG.domain_origin(),
-            "object":"auth-request"
-        }
-    )))
+    let response_date_utc = auth_request.response_date.map(|response_date| format_date(&response_date));
+
+    Ok(Json(json!({
+        "id": uuid,
+        "publicKey": auth_request.public_key,
+        "requestDeviceType": DeviceType::from_i32(auth_request.device_type).to_string(),
+        "requestIpAddress": auth_request.request_ip,
+        "key": auth_request.enc_key,
+        "masterPasswordHash": auth_request.master_password_hash,
+        "creationDate": format_date(&auth_request.creation_date),
+        "responseDate": response_date_utc,
+        "requestApproved": auth_request.approved,
+        "origin": CONFIG.domain_origin(),
+        "object":"auth-request"
+    })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1174,6 +1238,7 @@ struct AuthResponseRequest {
 async fn put_auth_request(
     uuid: &str,
     data: Json<AuthResponseRequest>,
+    headers: Headers,
     mut conn: DbConn,
     ant: AnonymousNotify<'_>,
     nt: Notify<'_>,
@@ -1181,75 +1246,84 @@ async fn put_auth_request(
     let data = data.into_inner();
     let mut auth_request: AuthRequest = match AuthRequest::find_by_uuid(uuid, &mut conn).await {
         Some(auth_request) => auth_request,
-        None => {
-            err!("AuthRequest doesn't exist")
-        }
+        None => err!("AuthRequest doesn't exist", "Record not found"),
     };
 
-    auth_request.approved = Some(data.request_approved);
-    auth_request.enc_key = Some(data.key);
-    auth_request.master_password_hash = data.master_password_hash;
-    auth_request.response_device_id = Some(data.device_identifier.clone());
-    auth_request.save(&mut conn).await?;
-
-    if auth_request.approved.unwrap_or(false) {
-        ant.send_auth_response(&auth_request.user_uuid, &auth_request.uuid).await;
-        nt.send_auth_response(&auth_request.user_uuid, &auth_request.uuid, data.device_identifier, &mut conn).await;
+    if headers.user.uuid != auth_request.user_uuid {
+        err!("AuthRequest doesn't exist", "User uuid's do not match")
     }
 
-    let response_date_utc = auth_request
-        .response_date
-        .map(|response_date| response_date.and_utc().to_rfc3339_opts(SecondsFormat::Micros, true));
+    if auth_request.approved.is_some() {
+        err!("An authentication request with the same device already exists")
+    }
 
-    Ok(Json(json!(
-        {
-            "id": uuid,
-            "publicKey": auth_request.public_key,
-            "requestDeviceType": DeviceType::from_i32(auth_request.device_type).to_string(),
-            "requestIpAddress": auth_request.request_ip,
-            "key": auth_request.enc_key,
-            "masterPasswordHash": auth_request.master_password_hash,
-            "creationDate": auth_request.creation_date.and_utc().to_rfc3339_opts(SecondsFormat::Micros, true),
-            "responseDate": response_date_utc,
-            "requestApproved": auth_request.approved,
-            "origin": CONFIG.domain_origin(),
-            "object":"auth-request"
-        }
-    )))
+    let response_date = Utc::now().naive_utc();
+    let response_date_utc = format_date(&response_date);
+
+    if data.request_approved {
+        auth_request.approved = Some(data.request_approved);
+        auth_request.enc_key = Some(data.key);
+        auth_request.master_password_hash = data.master_password_hash;
+        auth_request.response_device_id = Some(data.device_identifier.clone());
+        auth_request.response_date = Some(response_date);
+        auth_request.save(&mut conn).await?;
+
+        ant.send_auth_response(&auth_request.user_uuid, &auth_request.uuid).await;
+        nt.send_auth_response(&auth_request.user_uuid, &auth_request.uuid, data.device_identifier, &mut conn).await;
+    } else {
+        // If denied, there's no reason to keep the request
+        auth_request.delete(&mut conn).await?;
+    }
+
+    Ok(Json(json!({
+        "id": uuid,
+        "publicKey": auth_request.public_key,
+        "requestDeviceType": DeviceType::from_i32(auth_request.device_type).to_string(),
+        "requestIpAddress": auth_request.request_ip,
+        "key": auth_request.enc_key,
+        "masterPasswordHash": auth_request.master_password_hash,
+        "creationDate": format_date(&auth_request.creation_date),
+        "responseDate": response_date_utc,
+        "requestApproved": auth_request.approved,
+        "origin": CONFIG.domain_origin(),
+        "object":"auth-request"
+    })))
 }
 
 #[get("/auth-requests/<uuid>/response?<code>")]
-async fn get_auth_request_response(uuid: &str, code: &str, mut conn: DbConn) -> JsonResult {
+async fn get_auth_request_response(
+    uuid: &str,
+    code: &str,
+    client_headers: ClientHeaders,
+    mut conn: DbConn,
+) -> JsonResult {
     let auth_request = match AuthRequest::find_by_uuid(uuid, &mut conn).await {
         Some(auth_request) => auth_request,
-        None => {
-            err!("AuthRequest doesn't exist")
-        }
+        None => err!("AuthRequest doesn't exist", "User not found"),
     };
 
-    if !auth_request.check_access_code(code) {
-        err!("Access code invalid doesn't exist")
+    if auth_request.device_type != client_headers.device_type
+        || auth_request.request_ip != client_headers.ip.ip.to_string()
+        || !auth_request.check_access_code(code)
+    {
+        err!("AuthRequest doesn't exist", "Invalid device, IP or code")
     }
 
-    let response_date_utc = auth_request
-        .response_date
-        .map(|response_date| response_date.and_utc().to_rfc3339_opts(SecondsFormat::Micros, true));
+    let response_date_utc = auth_request.response_date.map(|response_date| format_date(&response_date));
 
-    Ok(Json(json!(
-        {
-            "id": uuid,
-            "publicKey": auth_request.public_key,
-            "requestDeviceType": DeviceType::from_i32(auth_request.device_type).to_string(),
-            "requestIpAddress": auth_request.request_ip,
-            "key": auth_request.enc_key,
-            "masterPasswordHash": auth_request.master_password_hash,
-            "creationDate": auth_request.creation_date.and_utc().to_rfc3339_opts(SecondsFormat::Micros, true),
-            "responseDate": response_date_utc,
-            "requestApproved": auth_request.approved,
-            "origin": CONFIG.domain_origin(),
-            "object":"auth-request"
-        }
-    )))
+    Ok(Json(json!({
+        "id": uuid,
+        "publicKey": auth_request.public_key,
+        "requestDeviceType": DeviceType::from_i32(auth_request.device_type).to_string(),
+        "requestIpAddress": auth_request.request_ip,
+        "key": auth_request.enc_key,
+        "masterPasswordHash": auth_request.master_password_hash,
+        "creationDate": format_date(&auth_request.creation_date),
+        "responseDate": response_date_utc,
+        "requestApproved": auth_request.approved,
+        "origin": CONFIG.domain_origin(),
+        "object":"auth-request"
+    })))
 }
 
 #[get("/auth-requests")]
@@ -1261,7 +1335,7 @@ async fn get_auth_requests(headers: Headers, mut conn: DbConn) -> JsonResult {
             .iter()
             .filter(|request| request.approved.is_none())
             .map(|request| {
-            let response_date_utc = request.response_date.map(|response_date| response_date.and_utc().to_rfc3339_opts(SecondsFormat::Micros, true));
+            let response_date_utc = request.response_date.map(|response_date| format_date(&response_date));
 
             json!({
                 "id": request.uuid,
@@ -1270,7 +1344,7 @@ async fn get_auth_requests(headers: Headers, mut conn: DbConn) -> JsonResult {
                 "requestIpAddress": request.request_ip,
                 "key": request.enc_key,
                 "masterPasswordHash": request.master_password_hash,
-                "creationDate": request.creation_date.and_utc().to_rfc3339_opts(SecondsFormat::Micros, true),
+                "creationDate": format_date(&request.creation_date),
                 "responseDate": response_date_utc,
                 "requestApproved": request.approved,
                 "origin": CONFIG.domain_origin(),

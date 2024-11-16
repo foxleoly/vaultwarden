@@ -1,6 +1,6 @@
 use crate::util::LowerCase;
 use crate::CONFIG;
-use chrono::{DateTime, NaiveDateTime, TimeDelta, Utc};
+use chrono::{NaiveDateTime, TimeDelta, Utc};
 use serde_json::Value;
 
 use super::{
@@ -30,7 +30,8 @@ db_object! {
         Login = 1,
         SecureNote = 2,
         Card = 3,
-        Identity = 4
+        Identity = 4,
+        SshKey = 5
         */
         pub atype: i32,
         pub name: String,
@@ -216,11 +217,13 @@ impl Cipher {
                         Some(p) if p.is_string() => Some(d.data),
                         _ => None,
                     })
-                    .map(|d| match d.get("lastUsedDate").and_then(|l| l.as_str()) {
-                        Some(l) if DateTime::parse_from_rfc3339(l).is_ok() => d,
+                    .map(|mut d| match d.get("lastUsedDate").and_then(|l| l.as_str()) {
+                        Some(l) => {
+                            d["lastUsedDate"] = json!(crate::util::validate_and_format_date(l));
+                            d
+                        }
                         _ => {
-                            let mut d = d;
-                            d["lastUsedDate"] = json!("1970-01-01T00:00:00.000Z");
+                            d["lastUsedDate"] = json!("1970-01-01T00:00:00.000000Z");
                             d
                         }
                     })
@@ -317,6 +320,7 @@ impl Cipher {
             "secureNote": null,
             "card": null,
             "identity": null,
+            "sshKey": null,
         });
 
         // These values are only needed for user/default syncs
@@ -345,6 +349,7 @@ impl Cipher {
             2 => "secureNote",
             3 => "card",
             4 => "identity",
+            5 => "sshKey",
             _ => panic!("Wrong type"),
         };
 
